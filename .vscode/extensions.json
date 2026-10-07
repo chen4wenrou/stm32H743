@@ -1,0 +1,10 @@
+{
+    "recommendations": [
+        "stmicroelectronics.stm32cube-ide-extension-pack",
+        "stmicroelectronics.stm32cube-ide-clangd",
+        "stmicroelectronics.stm32cube-ide-debug",
+        "marus25.cortex-debug",
+        "ms-vscode.cpptools"
+    ],
+    "unwantedRecommendations": []
+}
