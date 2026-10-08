@@ -469,6 +469,105 @@ lv_label_set_text(wdg_status_label, "Watchdog: OFF");
 
 ---
 
+## 核心坑点14：低功耗模式
+
+### 功能说明
+在 SET 页面添加低功耗模式开关，实现自动息屏和双击唤醒。
+
+### 实现要点
+
+**1. LCD 背光控制**
+```c
+/* 关闭 LCD 背光（息屏） */
+static void lcd_backlight_off(void)
+{
+    HAL_GPIO_WritePin(LCD_BLK_GPIO_Port, LCD_BLK_Pin, GPIO_PIN_RESET);
+    lp_screen_off = true;
+}
+
+/* 开启 LCD 背光（唤醒） */
+static void lcd_backlight_on(void)
+{
+    HAL_GPIO_WritePin(LCD_BLK_GPIO_Port, LCD_BLK_Pin, GPIO_PIN_SET);
+    lp_screen_off = false;
+}
+```
+
+**2. 双击检测算法**
+```c
+static void lp_check_double_tap(int32_t raw_x, int32_t raw_y)
+{
+    uint32_t now = HAL_GetTick();
+
+    if(pressed && !was_pressed) {
+        /* 按下瞬间 */
+        if(now - lp_last_touch_time < lp_tap_timeout) {
+            /* 双击检测成功 */
+            lp_tap_count++;
+            if(lp_tap_count >= 2) {
+                lcd_backlight_on();  /* 双击唤醒 */
+                lp_tap_count = 0;
+            }
+        } else {
+            lp_tap_count = 1;  /* 超时，重新计数 */
+        }
+        lp_last_touch_time = now;
+    }
+}
+```
+
+**3. 自动息屏检测**
+```c
+static void lp_auto_off_timer_cb(lv_timer_t * timer)
+{
+    if(!lp_enabled || lp_screen_off) return;
+
+    /* 检测是否有触摸活动 */
+    if(pressed) {
+        last_activity_time = now;
+    }
+
+    /* 超过 30 秒无操作，自动息屏 */
+    if(now - last_activity_time > 30000) {
+        lcd_backlight_off();
+    }
+}
+```
+
+**4. SET 页面 UI**
+```c
+/* 低功耗模式开关 */
+lp_switch = lv_switch_create(scr_set);
+lv_obj_set_size(lp_switch, 50, 25);
+lv_obj_set_pos(lp_switch, 15, 220);
+lv_obj_add_event_cb(lp_switch, lp_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+/* 状态标签 */
+lp_status_label = lv_label_create(scr_set);
+lv_label_set_text(lp_status_label, "Low Power: OFF");
+```
+
+**5. 定时器配置**
+```c
+/* 自动息屏定时器（每 1 秒检查一次） */
+lv_timer_create(lp_auto_off_timer_cb, 1000, NULL);
+```
+
+### 使用方法
+1. 进入 SET 页面
+2. 找到 "Low Power Mode" 区域
+3. 滑动开关启用低功耗模式
+4. 30 秒无操作自动息屏
+5. 双击屏幕唤醒
+
+### 注意事项
+- 双击间隔需在 500ms 内
+- 息屏后跳过所有触摸处理
+- 禁用低功耗模式时会立即唤醒屏幕
+- 自动息屏时间可在代码中调整（默认 30 秒）
+
+---
+
 ## 总结
 
 **核心原则**：

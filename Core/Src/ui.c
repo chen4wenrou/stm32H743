@@ -78,6 +78,16 @@ static lv_obj_t * wdg_status_label = NULL;  /* 看门狗状态标签 */
 static IWDG_HandleTypeDef hiwdg;
 static bool wdg_enabled = false;  /* 看门狗是否启用 */
 
+/* ★ 低功耗模式相关 */
+static lv_obj_t * lp_switch = NULL;  /* 低功耗模式开关 */
+static lv_obj_t * lp_status_label = NULL;  /* 低功耗模式状态标签 */
+static bool lp_enabled = false;  /* 低功耗模式是否启用 */
+static bool lp_screen_off = false;  /* 屏幕是否已关闭 */
+static uint32_t lp_last_touch_time = 0;  /* 上次触摸时间（用于双击检测） */
+static uint32_t lp_last_activity_time = 0;  /* 上次活动时间（用于自动息屏） */
+static uint8_t lp_tap_count = 0;  /* 双击计数 */
+static uint32_t lp_tap_timeout = 500;  /* 双击超时时间（ms） */
+
 /* ★ 背景图片资源 */
 LV_IMAGE_DECLARE(photo_01);
 LV_IMAGE_DECLARE(photo_02);
@@ -551,6 +561,116 @@ static void wdg_switch_cb(lv_event_t * e)
     }
 }
 
+/* ================================================================
+ *  低功耗模式功能
+ * ================================================================ */
+
+/* 关闭 LCD 背光（息屏） */
+static void lcd_backlight_off(void)
+{
+    HAL_GPIO_WritePin(LCD_BLK_GPIO_Port, LCD_BLK_Pin, GPIO_PIN_RESET);
+    lp_screen_off = true;
+}
+
+/* 开启 LCD 背光（唤醒） */
+static void lcd_backlight_on(void)
+{
+    HAL_GPIO_WritePin(LCD_BLK_GPIO_Port, LCD_BLK_Pin, GPIO_PIN_SET);
+    lp_screen_off = false;
+}
+
+/* 低功耗模式开关回调函数 */
+static void lp_switch_cb(lv_event_t * e)
+{
+    lv_obj_t * sw = lv_event_get_target(e);
+    bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
+
+    if(checked) {
+        /* 启用低功耗模式 */
+        lp_enabled = true;
+        lp_last_activity_time = HAL_GetTick();  /* 初始化活动时间 */
+        if(lp_status_label) {
+            lv_label_set_text(lp_status_label, "ON");
+            lv_obj_set_style_text_color(lp_status_label, lv_color_hex(0x00FF00), 0);
+        }
+    } else {
+        /* 禁用低功耗模式 */
+        lp_enabled = false;
+        /* 如果屏幕已关闭，立即唤醒 */
+        if(lp_screen_off) {
+            lcd_backlight_on();
+        }
+        if(lp_status_label) {
+            lv_label_set_text(lp_status_label, "OFF");
+            lv_obj_set_style_text_color(lp_status_label, lv_color_hex(0xFF6B6B), 0);
+        }
+    }
+}
+
+/* 检测双击唤醒 */
+static void lp_check_double_tap(bool pressed)
+{
+    if(!lp_enabled || !lp_screen_off) {
+        return;  /* 低功耗模式未启用或屏幕未关闭 */
+    }
+
+    uint32_t now = HAL_GetTick();
+
+    /* 检测触摸事件 */
+    static bool was_pressed_lp = false;
+
+    if(pressed && !was_pressed_lp) {
+        /* 按下瞬间 */
+        was_pressed_lp = true;
+
+        if(now - lp_last_touch_time < lp_tap_timeout) {
+            /* 双击检测成功 */
+            lp_tap_count++;
+            if(lp_tap_count >= 2) {
+                /* 双击唤醒 */
+                lcd_backlight_on();
+                lp_tap_count = 0;
+            }
+        } else {
+            /* 超时，重新计数 */
+            lp_tap_count = 1;
+        }
+        lp_last_touch_time = now;
+    } else if(!pressed) {
+        was_pressed_lp = false;
+    }
+}
+
+/* 更新活动时间（在触摸检测时调用） */
+static void lp_update_activity(void)
+{
+    if(lp_enabled && !lp_screen_off) {
+        lp_last_activity_time = HAL_GetTick();
+    }
+}
+
+/* 自动息屏定时器回调 */
+static void lp_auto_off_timer_cb(lv_timer_t * timer)
+{
+    (void)timer;
+
+    if(!lp_enabled || lp_screen_off) {
+        return;  /* 低功耗模式未启用或已息屏 */
+    }
+
+    /* 初始化：第一次调用时设置为当前时间 */
+    if(lp_last_activity_time == 0) {
+        lp_last_activity_time = HAL_GetTick();
+        return;
+    }
+
+    /* 超过 5 秒无操作，自动息屏 */
+    uint32_t now = HAL_GetTick();
+    if(now - lp_last_activity_time > 5000) {
+        lcd_backlight_off();
+    }
+}
+
 /* SET 背景图片下拉框变化 */
 static void bg_dropdown_cb(lv_event_t * e)
 {
@@ -759,6 +879,19 @@ static void data_update_timer_cb(lv_timer_t * timer)
     int32_t raw_x, raw_y;
     bool pressed;
     lv_port_indev_get_raw(&raw_x, &raw_y, &pressed);
+
+    /* 双击唤醒检测 */
+    lp_check_double_tap(pressed);
+
+    /* 如果屏幕已关闭，跳过后续触摸处理 */
+    if(lp_screen_off) {
+        return;
+    }
+
+    /* 更新活动时间（用于自动息屏） */
+    if(pressed) {
+        lp_update_activity();
+    }
 
     /* 更新调试标签：显示 raw 坐标和btn_visible状态 */
     if(debug_label && pressed) {
@@ -1400,16 +1533,16 @@ void ui_init(void)
     {
         /* 背景图片选择标签 */
         lv_obj_t * bg_label = lv_label_create(scr_set);
-        lv_label_set_text(bg_label, "Background Image:");
+        lv_label_set_text(bg_label, "Background:");
         lv_obj_set_style_text_color(bg_label, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_text_font(bg_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_pos(bg_label, 15, 35);
+        lv_obj_set_pos(bg_label, 15, 30);
 
         /* 下拉框：选择背景图片 */
         set_dropdown = lv_dropdown_create(scr_set);
         lv_dropdown_set_options(set_dropdown, "Image 01\nImage 02\nImage 03");
-        lv_obj_set_size(set_dropdown, 150, 35);
-        lv_obj_set_pos(set_dropdown, 15, 55);
+        lv_obj_set_size(set_dropdown, 120, 30);
+        lv_obj_set_pos(set_dropdown, 15, 48);
         lv_obj_set_style_bg_color(set_dropdown, lv_color_hex(0x3498DB), 0);
         lv_obj_set_style_text_color(set_dropdown, lv_color_hex(0xFFFFFF), 0);
         lv_obj_add_event_cb(set_dropdown, bg_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -1417,54 +1550,83 @@ void ui_init(void)
         /* 预览图片：显示当前选中的背景 */
         set_preview_img = lv_image_create(scr_set);
         lv_image_set_src(set_preview_img, bg_images[current_bg_index]);
-        lv_obj_set_size(set_preview_img, 160, 120);
-        lv_obj_set_pos(set_preview_img, 140, 35);
+        lv_obj_set_size(set_preview_img, 100, 75);
+        lv_obj_set_pos(set_preview_img, 200, 30);
         lv_obj_set_style_border_color(set_preview_img, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_border_width(set_preview_img, 2, 0);
 
-        /* 提示标签 */
-        lv_obj_t * hint_label = lv_label_create(scr_set);
-        lv_label_set_text(hint_label, "Select image to change background");
-        lv_obj_set_style_text_color(hint_label, lv_color_hex(0xAAAAAA), 0);
-        lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_pos(hint_label, 15, 100);
-
         /* ================================================================
-         *  看门狗功能区域
+         *  看门狗功能区域（左半部分）
          * ================================================================ */
 
         /* 看门狗标签 */
         lv_obj_t * wdg_label = lv_label_create(scr_set);
-        lv_label_set_text(wdg_label, "Watchdog Timer:");
+        lv_label_set_text(wdg_label, "Watchdog:");
         lv_obj_set_style_text_color(wdg_label, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_text_font(wdg_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_pos(wdg_label, 15, 130);
+        lv_obj_set_pos(wdg_label, 15, 90);
 
         /* 看门狗开关 */
         wdg_switch = lv_switch_create(scr_set);
-        lv_obj_set_size(wdg_switch, 50, 25);
-        lv_obj_set_pos(wdg_switch, 15, 150);
+        lv_obj_set_size(wdg_switch, 40, 20);
+        lv_obj_set_pos(wdg_switch, 15, 110);
         lv_obj_set_style_bg_color(wdg_switch, lv_color_hex(0x95A5A6), 0);  /* 关闭状态：灰色 */
         lv_obj_set_style_bg_color(wdg_switch, lv_color_hex(0x27AE60), LV_STATE_CHECKED);  /* 开启状态：绿色 */
         lv_obj_add_event_cb(wdg_switch, wdg_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
         /* 看门狗状态标签 */
         wdg_status_label = lv_label_create(scr_set);
-        lv_label_set_text(wdg_status_label, "Watchdog: OFF");
+        lv_label_set_text(wdg_status_label, "OFF");
         lv_obj_set_style_text_color(wdg_status_label, lv_color_hex(0xFF6B6B), 0);
         lv_obj_set_style_text_font(wdg_status_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_pos(wdg_status_label, 75, 153);
+        lv_obj_set_pos(wdg_status_label, 65, 113);
 
         /* 看门狗说明 */
         lv_obj_t * wdg_hint = lv_label_create(scr_set);
-        lv_label_set_text(wdg_hint, "Timeout: ~1 second");
+        lv_label_set_text(wdg_hint, "~1s timeout");
         lv_obj_set_style_text_color(wdg_hint, lv_color_hex(0xAAAAAA), 0);
         lv_obj_set_style_text_font(wdg_hint, &lv_font_montserrat_12, 0);
-        lv_obj_set_pos(wdg_hint, 15, 180);
+        lv_obj_set_pos(wdg_hint, 15, 135);
+
+        /* ================================================================
+         *  低功耗模式区域（右半部分）
+         * ================================================================ */
+
+        /* 低功耗模式标签 */
+        lv_obj_t * lp_label = lv_label_create(scr_set);
+        lv_label_set_text(lp_label, "Low Power:");
+        lv_obj_set_style_text_color(lp_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(lp_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_pos(lp_label, 160, 90);
+
+        /* 低功耗模式开关 */
+        lp_switch = lv_switch_create(scr_set);
+        lv_obj_set_size(lp_switch, 40, 20);
+        lv_obj_set_pos(lp_switch, 160, 110);
+        lv_obj_set_style_bg_color(lp_switch, lv_color_hex(0x95A5A6), 0);  /* 关闭状态：灰色 */
+        lv_obj_set_style_bg_color(lp_switch, lv_color_hex(0x27AE60), LV_STATE_CHECKED);  /* 开启状态：绿色 */
+        lv_obj_add_event_cb(lp_switch, lp_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+        /* 低功耗模式状态标签 */
+        lp_status_label = lv_label_create(scr_set);
+        lv_label_set_text(lp_status_label, "OFF");
+        lv_obj_set_style_text_color(lp_status_label, lv_color_hex(0xFF6B6B), 0);
+        lv_obj_set_style_text_font(lp_status_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_pos(lp_status_label, 210, 113);
+
+        /* 低功耗模式说明 */
+        lv_obj_t * lp_hint = lv_label_create(scr_set);
+        lv_label_set_text(lp_hint, "Double tap wake");
+        lv_obj_set_style_text_color(lp_hint, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_font(lp_hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_pos(lp_hint, 160, 135);
     }
 
     /* 第2步：定时器（用 raw 坐标检测触摸） */
     lv_timer_create(data_update_timer_cb, 100, NULL);
+
+    /* 第3步：自动息屏定时器（每 1 秒检查一次） */
+    lv_timer_create(lp_auto_off_timer_cb, 1000, NULL);
 
     /* 第4步：启动 UART 接收 */
     HAL_UART_Receive_IT(&huart4, &uart_rx_byte, 1);
